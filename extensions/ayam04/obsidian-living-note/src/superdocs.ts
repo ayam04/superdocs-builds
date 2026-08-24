@@ -1,5 +1,5 @@
 import { requestUrl } from "obsidian";
-import type { JobStatus, PendingChange } from "./types";
+import type { JobStatus, JobUsage, PendingChange } from "./types";
 
 interface RequestOptions {
   method?: "GET" | "POST";
@@ -11,6 +11,12 @@ export interface UploadedDocument {
   html?: string;
   chunks_count?: number;
   [key: string]: unknown;
+}
+
+interface AttachmentStatus {
+  processing_jobs?: Array<{ filename?: string; status?: string; error?: string | null }>;
+  ready_attachments?: Array<{ filename?: string }>;
+  total_processing?: number;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -55,7 +61,7 @@ export class SuperDocsClient {
         const parsed = JSON.parse(response.text) as { detail?: unknown; error?: unknown };
         detail = typeof parsed.detail === "string" ? parsed.detail : typeof parsed.error === "string" ? parsed.error : detail;
       } catch {
-        // Avoid exposing response bodies that could contain credentials or provider details.
+        // The body can be an HTML gateway error; do not echo it into a notice.
       }
       throw new SuperDocsError(`${detail} (HTTP ${response.status})`, response.status);
     }
@@ -67,6 +73,7 @@ export class SuperDocsClient {
     }
   }
 
+  /** The editable document. Only owned-region content is ever sent here. */
   async uploadDocument(sessionId: string, filename: string, markdown: string): Promise<UploadedDocument> {
     return this.request<UploadedDocument>("/v1/documents/upload-base64", {
       method: "POST",
@@ -74,11 +81,12 @@ export class SuperDocsClient {
         filename,
         file_base64: encodeBase64(markdown),
         session_id: sessionId,
-        return_html: false,
+        return_html: true,
       },
     });
   }
 
+  /** Read-only context. Attachments cannot be edited by the agent. */
   async uploadReference(sessionId: string, filename: string, markdown: string): Promise<void> {
     await this.request<Record<string, unknown>>("/v1/attachments/upload-base64", {
       method: "POST",
@@ -90,18 +98,21 @@ export class SuperDocsClient {
     });
   }
 
-  async waitForAttachments(sessionId: string, timeoutMs = 90_000): Promise<void> {
+  async waitForAttachments(sessionId: string, expected: number, timeoutMs = 120_000): Promise<void> {
+    if (expected === 0) return;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const status = await this.request<unknown>(`/v1/attachments/status/${encodeURIComponent(sessionId)}`);
-      const states = attachmentStates(status);
-      if (states.some((state) => state === "failed")) {
-        throw new SuperDocsError("a reference attachment failed to process; no edit was started", 422, "attachment_failed");
+      const status = await this.request<AttachmentStatus>(`/v1/attachments/status/${encodeURIComponent(sessionId)}`);
+      const failed = (status.processing_jobs ?? []).find((job) => job.status === "failed");
+      if (failed) {
+        throw new SuperDocsError(`reference attachment '${failed.filename ?? "unknown"}' failed to process; no edit was started`, 422, "attachment_failed");
       }
-      if (states.length === 0 || states.every((state) => state === "completed")) return;
+      const pending = (status.processing_jobs ?? []).filter((job) => job.status !== "completed").length;
+      const ready = (status.ready_attachments ?? []).length;
+      if (pending === 0 && ready >= expected) return;
       await sleep(1_500);
     }
-    throw new SuperDocsError("reference attachments did not finish processing before the preview deadline", 408, "attachment_timeout");
+    throw new SuperDocsError("reference attachments did not finish processing in time; no edit was started", 408, "attachment_timeout");
   }
 
   async startReconciliation(args: {
@@ -136,33 +147,26 @@ export class SuperDocsClient {
     return this.request<JobStatus>(`/v1/jobs/${encodeURIComponent(jobId)}`);
   }
 
-  async approveChanges(sessionId: string, jobId: string, changes: Array<{ change_id: string; approved: boolean; feedback?: string }>): Promise<void> {
-    if (changes.length === 0) return;
+  /**
+   * The API requires a top-level `approved` even when every entry carries its
+   * own decision; without it the request is rejected with a bare 422.
+   */
+  async approveChanges(sessionId: string, jobId: string, decisions: Array<{ change_id: string; approved: boolean; feedback?: string }>): Promise<void> {
+    if (decisions.length === 0) return;
     await this.request(`/v1/chat/${encodeURIComponent(sessionId)}/approve`, {
       method: "POST",
       body: {
         job_id: jobId,
-        approved: changes[0].approved,
-        changes,
+        approved: decisions.some((decision) => decision.approved),
+        changes: decisions,
       },
     });
-  }
-
-  async waitForCompletion(jobId: string, onStatus: (status: JobStatus) => Promise<void> | void, timeoutMs = 15 * 60_000): Promise<JobStatus> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const status = await this.getJob(jobId);
-      await onStatus(status);
-      if (["completed", "failed", "cancelled"].includes(status.status)) return status;
-      await sleep(1_500);
-    }
-    throw new SuperDocsError("SuperDocs job exceeded the configured stopping deadline", 408, "job_timeout");
   }
 
   async exportMarkdown(sessionId: string): Promise<string> {
     const bytes = await this.request<ArrayBuffer>("/v1/documents/export", {
       method: "POST",
-      body: { session_id: sessionId, format: "markdown", options: { filename: "living-note.md" } },
+      body: { session_id: sessionId, format: "markdown", options: { filename: "living-note" } },
       binary: true,
     });
     return new TextDecoder().decode(bytes);
@@ -179,26 +183,28 @@ function encodeBase64(value: string): string {
   return btoa(binary);
 }
 
+/**
+ * Polling returns proposed changes as objects. The SSE surface delivers the same
+ * payload as a JSON string, so a string entry is parsed rather than dropped.
+ */
 export function pendingChanges(job: JobStatus): PendingChange[] {
-  return job.metadata?.pending_changes ?? [];
+  const raw = job.metadata?.pending_changes;
+  if (!Array.isArray(raw)) return [];
+  const changes: PendingChange[] = [];
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      try {
+        changes.push(JSON.parse(entry) as PendingChange);
+      } catch {
+        throw new SuperDocsError("SuperDocs returned a proposed change that could not be read", 502, "unreadable_change");
+      }
+      continue;
+    }
+    if (entry && typeof entry === "object") changes.push(entry as PendingChange);
+  }
+  return changes;
 }
 
-function attachmentStates(value: unknown): string[] {
-  const states: string[] = [];
-  const visit = (node: unknown): void => {
-    if (!node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-      return;
-    }
-    for (const [key, child] of Object.entries(node)) {
-      if ((key === "status" || key === "state") && typeof child === "string" && ["pending", "processing", "completed", "failed"].includes(child)) {
-        states.push(child);
-      } else {
-        visit(child);
-      }
-    }
-  };
-  visit(value);
-  return states;
+export function jobUsage(job: JobStatus): JobUsage {
+  return job.usage ?? job.result?.usage ?? {};
 }

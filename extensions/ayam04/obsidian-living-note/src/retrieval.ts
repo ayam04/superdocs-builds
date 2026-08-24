@@ -1,4 +1,5 @@
 import type { App, TFile } from "obsidian";
+import { buildRegionDocument } from "./ownership";
 import type { OwnershipRegion, PreviewPlan, SourceFingerprint, SourceNote } from "./types";
 
 const STOP_WORDS = new Set([
@@ -69,7 +70,7 @@ export async function createPreviewPlan(
   targetContent: string,
   maxSources: number,
 ): Promise<PreviewPlan> {
-  const query = regions.map((region) => targetContent.slice(region.contentStart, region.contentEnd)).join("\n");
+  const query = `${targetPath}\n${regions.map((region) => region.id).join(" ")}\n${targetContent}`;
   const files = eligibleSourceFiles(app, targetPath, sourceFolders);
   const fingerprint = fingerprintFiles(files.map((file) => ({ path: file.path, mtime: file.stat.mtime, size: file.stat.size })));
   const sources = await retrieveSources(app, targetPath, sourceFolders, query, maxSources);
@@ -78,6 +79,7 @@ export async function createPreviewPlan(
     regions: regions.map((region) => region.id),
     sources,
     sourceFingerprint: fingerprint,
+    regionDocument: buildRegionDocument(targetContent, regions).markdown,
     prompt: `Reconcile owned regions ${regions.map((region) => region.id).join(", ")} from the selected vault sources.`,
   };
 }

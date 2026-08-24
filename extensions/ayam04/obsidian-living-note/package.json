@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs development",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --tsconfig tests/tsconfig.json --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
